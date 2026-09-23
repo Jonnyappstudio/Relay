@@ -1,6 +1,9 @@
 name: Release Relay
 
 on:
+  push:
+    tags:
+      - relay-v*
   workflow_dispatch:
     inputs:
       version:
@@ -53,7 +56,7 @@ jobs:
         run: npm ci
 
       - name: Set release version
-        run: node scripts/set-version.mjs "${{ inputs.version }}"
+        run: node scripts/set-version.mjs "${{ github.event_name == 'push' && github.ref_name || inputs.version }}"
 
       - name: Build installers and publish release
         uses: tauri-apps/tauri-action@v1
@@ -65,7 +68,7 @@ jobs:
         with:
           tagName: relay-v__VERSION__
           releaseName: Relay v__VERSION__
-          releaseBody: ${{ inputs.notes }}
+          releaseBody: ${{ inputs.notes || 'Relay improvements and fixes.' }}
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true

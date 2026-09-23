@@ -10,7 +10,7 @@ Customers install Relay using the macOS `.dmg` or Windows `-setup.exe` attached 
 
 Downloads and the signed update feed are published at `https://github.com/Jonnyappstudio/Relay/releases`.
 
-Releases are automated by `.github/workflows/release.yml`. Run **Release Relay** from the GitHub Actions page, enter a new semantic version and release notes, and the workflow builds Apple Silicon Mac, Intel Mac, and Windows installers. The repository must define `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` Actions secrets. The updater public key is safe and is embedded in `src-tauri/tauri.conf.json`; never commit or share the private key.
+Releases are automated by `.github/workflows/release.yml`. Push a version tag such as `relay-v0.1.1` and GitHub automatically builds and publishes Apple Silicon Mac, Intel Mac, and Windows installers. The **Release Relay** button on the GitHub Actions page remains available as a manual fallback. The repository must define `TAURI_SIGNING_PRIVATE_KEY` and, when applicable, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` Actions secrets. The updater public key is safe and is embedded in `src-tauri/tauri.conf.json`; never commit or share the private key.
 
 For local development, install Node.js LTS, Rust stable, and the Tauri prerequisites, then run `npm install` and `npm run desktop`.
 

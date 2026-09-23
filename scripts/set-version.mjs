@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
-const version = process.argv[2]?.replace(/^v/, "");
+const version = process.argv[2]?.replace(/^(?:relay-)?v/, "");
 if (!/^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$/.test(version || "")) {
   throw new Error("Provide a semantic version such as 0.2.0");
 }
