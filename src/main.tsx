@@ -187,6 +187,7 @@ function App() {
   const [serialPorts, setSerialPorts] = useState<string[]>([]);
   const [serialPortsLoading, setSerialPortsLoading] = useState(false);
   const [draggedId, setDraggedId] = useState<string>();
+  const [draggedFolder, setDraggedFolder] = useState<string>();
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [folderDialog, setFolderDialog] = useState<FolderDialog>();
   const [hostIssue, setHostIssue] = useState<HostIssue>();
@@ -582,6 +583,58 @@ function App() {
     document.addEventListener("pointerup", pointerUp);
     document.addEventListener("pointercancel", pointerUp);
   }
+
+  function moveFolder(source: string, targetParent: string) {
+    const label = source.slice(source.lastIndexOf("/") + 1);
+    const destination = targetParent ? `${targetParent}/${label}` : label;
+    if (destination === source) return;
+    if (targetParent === source || targetParent.startsWith(`${source}/`)) {
+      setError("A folder cannot be moved inside itself.");
+      return;
+    }
+    const moving = folders.filter(path => path === source || path.startsWith(`${source}/`));
+    const movingSet = new Set(moving);
+    const replacePrefix = (value: string) => value === source ? destination : value.startsWith(`${source}/`) ? `${destination}${value.slice(source.length)}` : value;
+    if (moving.some(path => folders.includes(replacePrefix(path)) && !movingSet.has(replacePrefix(path)))) {
+      setError(`“${label}” conflicts with a folder already in that location.`);
+      return;
+    }
+    setFolders(items => items.map(replacePrefix));
+    setConnections(items => items.map(item => ({ ...item, folder: replacePrefix(item.folder) })));
+    setSelectedFolder(current => current ? replacePrefix(current) : current);
+    setCollapsed(current => {
+      const next = Object.fromEntries(Object.entries(current).map(([key, value]) => [replacePrefix(key), value]));
+      if (targetParent) next[targetParent] = false;
+      next[destination] = false;
+      return next;
+    });
+  }
+
+  function beginFolderDrag(event: React.PointerEvent, folder: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    let target: string | null = null;
+    setDraggedFolder(folder);
+    document.body.classList.add("dragging-folder");
+    const pointerMove = (moveEvent: PointerEvent) => {
+      const destination = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY)?.closest<HTMLElement>("[data-drop-folder]");
+      const candidate = destination?.dataset.dropFolder ?? null;
+      target = candidate !== null && candidate !== folder && !candidate.startsWith(`${folder}/`) ? candidate : null;
+      setDropTarget(target);
+    };
+    const pointerUp = () => {
+      if (target !== null) moveFolder(folder, target);
+      setDraggedFolder(undefined);
+      setDropTarget(null);
+      document.body.classList.remove("dragging-folder");
+      document.removeEventListener("pointermove", pointerMove);
+      document.removeEventListener("pointerup", pointerUp);
+      document.removeEventListener("pointercancel", pointerUp);
+    };
+    document.addEventListener("pointermove", pointerMove);
+    document.addEventListener("pointerup", pointerUp);
+    document.addEventListener("pointercancel", pointerUp);
+  }
   const bookmark = (connection: Conn) => <div className={`bookmark ${active?.connection.id === connection.id ? "active" : ""} ${draggedId === connection.id ? "dragging" : ""}`} key={connection.id}>
     <button className="drag-handle" title="Drag to another folder" aria-label={`Move ${connection.name}`} onPointerDown={event => beginDrag(event, connection)}>⠿</button>
     <button className="bookmark-main" onClick={() => connect(connection)}><i/><span><b>{connection.name}</b><small>{connectionEndpoint(connection)}</small></span><em>{connectionTypeOf(connection).toUpperCase()}</em></button>
@@ -596,8 +649,9 @@ function App() {
     }).map(folder => {
       const label = folder.slice(folder.lastIndexOf("/") + 1);
       const childCount = folders.filter(path => path.startsWith(`${folder}/`) && !path.slice(folder.length + 1).includes("/")).length;
-      return <section data-drop-folder={folder} style={{ "--folder-depth": depth } as React.CSSProperties} className={`folder-section ${selectedFolder === folder ? "selected-folder" : ""} ${draggedId ? "drop-ready" : ""} ${dropTarget === folder ? "drop-target" : ""}`} key={folder}>
-        <h3><button className="collapse" title={collapsed[folder] ? "Open folder" : "Minimize folder"} onClick={() => setCollapsed(value => ({ ...value, [folder]: !value[folder] }))}>{collapsed[folder] ? "›" : "⌄"}</button><button className="folder-name" onClick={() => { setSelectedFolder(folder); setCollapsed(value => ({ ...value, [folder]: !value[folder] })); }}>▰　{label}</button><span className="folder-tools"><button title="Add subfolder" onClick={() => setFolderDialog({ mode: "create", folder })}>＋</button><button title="Rename folder" onClick={() => setFolderDialog({ mode: "rename", folder })}>✎</button><button title="Delete folder" onClick={() => setFolderDialog({ mode: "delete", folder })}>×</button><small>{visible(folder).length + childCount}</small></span></h3>
+      const invalidFolderTarget = draggedFolder && (folder === draggedFolder || folder.startsWith(`${draggedFolder}/`));
+      return <section data-drop-folder={folder} style={{ "--folder-depth": depth } as React.CSSProperties} className={`folder-section ${selectedFolder === folder ? "selected-folder" : ""} ${draggedFolder === folder ? "folder-dragging" : ""} ${(draggedId || draggedFolder) && !invalidFolderTarget ? "drop-ready" : ""} ${dropTarget === folder ? "drop-target" : ""}`} key={folder}>
+        <h3><button className="folder-drag-handle" title="Move folder" aria-label={`Move ${label}`} onPointerDown={event => beginFolderDrag(event, folder)}>⠿</button><button className="collapse" title={collapsed[folder] ? "Open folder" : "Minimize folder"} onClick={() => setCollapsed(value => ({ ...value, [folder]: !value[folder] }))}>{collapsed[folder] ? "›" : "⌄"}</button><button className="folder-name" onClick={() => { setSelectedFolder(folder); setCollapsed(value => ({ ...value, [folder]: !value[folder] })); }}>▰　{label}</button><span className="folder-tools"><button title="Add subfolder" onClick={() => setFolderDialog({ mode: "create", folder })}>＋</button><button title="Rename folder" onClick={() => setFolderDialog({ mode: "rename", folder })}>✎</button><button title="Delete folder" onClick={() => setFolderDialog({ mode: "delete", folder })}>×</button><small>{visible(folder).length + childCount}</small></span></h3>
         {!collapsed[folder] && <div className="folder-contents">{visible(folder).map(bookmark)}{renderFolders(folder, depth + 1)}</div>}
       </section>;
     });
@@ -619,7 +673,7 @@ function App() {
         <label className="search">⌕<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a connection…" /></label>
         <div className="add"><button onClick={openNewConnection}>＋ Connection</button><button onClick={() => setFolderDialog({ mode: "create", folder: selectedFolder || undefined })}>＋ Folder</button></div>
         <nav>
-          <section data-drop-folder="" className={`folder-section unfiled ${selectedFolder === null ? "selected-folder" : ""} ${draggedId ? "drop-ready" : ""} ${dropTarget === "" ? "drop-target" : ""}`}>
+          <section data-drop-folder="" className={`folder-section unfiled ${selectedFolder === null ? "selected-folder" : ""} ${(draggedId || draggedFolder) ? "drop-ready" : ""} ${dropTarget === "" ? "drop-target" : ""}`}>
             <h3><button className="folder-name" onClick={() => setSelectedFolder(null)}>⌄　No folder</button><small>{visible("").length}</small></h3>
             {visible("").map(bookmark)}
           </section>
