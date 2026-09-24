@@ -19,7 +19,7 @@ type Conn = {
   serialPort?: string; baudRate?: number; dataBits?: number; parity?: "none" | "odd" | "even";
   stopBits?: number; flowControl?: "none" | "software" | "hardware";
 };
-type Cmd = { id: string; name: string; command: string; uses: number; usesByConnection?: Record<string, number>; connectionId?: string; favorite?: boolean };
+type Cmd = { id: string; name: string; command: string; uses: number; usesByConnection?: Record<string, number>; connectionId?: string; favorite?: boolean; tracked?: boolean };
 type Sess = { id: string; connection: Conn; status: Status };
 type TermEvent = { sessionId: string; kind: string; data?: string; message?: string; fingerprint?: string };
 type FolderDialog = { mode: "create" | "rename" | "delete"; folder?: string };
@@ -28,6 +28,7 @@ type AuthIssue = { sessionId: string; message: string };
 type RemoteEntry = { name: string; path: string; is_dir: boolean; size: number };
 type DirectoryListing = { path: string; entries: RemoteEntry[] };
 type ExplorerState = DirectoryListing & { loading: boolean; error?: string };
+type ExplorerSupport = "checking" | "available" | "unavailable";
 
 const native = () => "__TAURI_INTERNALS__" in window;
 const connectionTypeOf = (connection: Conn): ConnectionType => connection.connectionType || "ssh";
@@ -45,6 +46,11 @@ const encode = (value: string) => {
 };
 const decode = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+const stripTerminalControls = (value: string) => value
+  .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+  .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+  .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+const isSensitivePrompt = (value: string) => /(?:password|passphrase|secret|token|pin|otp|verification code)(?:\s+for\s+[^:]+)?\s*:\s*$/i.test(value);
 const containsSensitiveMaterial = (command: string) => [
   /\b(pass(word)?|passwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+/i,
   /(^|\s)(--password|--token|--secret|--api-key)(=|\s+)\S+/i,
@@ -73,20 +79,20 @@ function migrateLegacyData() {
 const startupData = migrateLegacyData();
 function loadSafeCommands() {
   let commands = load<Cmd[]>("commands", []).filter(command => !["c1", "c2", "c3"].includes(command.id) && !containsSensitiveMaterial(command.command));
-  if (Number(localStorage.getItem("relay.commandPrivacyVersion") || 0) < 1) {
+  if (Number(localStorage.getItem("relay.commandPrivacyVersion") || 0) < 2) {
     commands = commands.filter(command => !(command.favorite === false && Boolean(command.connectionId) && command.name === command.command));
     localStorage.setItem("relay.commands", JSON.stringify(commands));
-    localStorage.setItem("relay.commandPrivacyVersion", "1");
+    localStorage.setItem("relay.commandPrivacyVersion", "2");
   }
   return commands;
 }
 
-function TerminalView({ session, visible, reconnect, setStatus, onHistory }: {
+function TerminalView({ session, visible, reconnect, setStatus, onCommand }: {
   session: Sess;
   visible: boolean;
   reconnect: (replaceChanged: boolean, acceptNew: boolean) => void;
   setStatus: (status: Status) => void;
-  onHistory: (commands: string[]) => void;
+  onCommand: (command: string) => void;
 }) {
   const element = useRef<HTMLDivElement>(null);
   const fit = useRef<FitAddon>();
@@ -104,7 +110,26 @@ function TerminalView({ session, visible, reconnect, setStatus, onHistory }: {
     fit.current = fitAddon;
     terminal.writeln(`\x1b[32mConnecting to ${connectionEndpoint(session.connection)}…\x1b[0m`);
 
+    let inputBuffer = "";
+    let recentOutput = "";
+    const recordInput = (data: string) => {
+      for (const character of data) {
+        if (character === "\r" || character === "\n") {
+          const command = inputBuffer.trim();
+          const prompt = recentOutput.replace(/\r/g, "\n").split("\n").at(-1) || "";
+          if (command && !isSensitivePrompt(prompt)) onCommand(command);
+          inputBuffer = "";
+        } else if (character === "\x7f" || character === "\b") {
+          inputBuffer = inputBuffer.slice(0, -1);
+        } else if (character === "\x03" || character === "\x15") {
+          inputBuffer = "";
+        } else if (character >= " " && character !== "\x7f" && !data.startsWith("\x1b")) {
+          inputBuffer += character;
+        }
+      }
+    };
     const input = terminal.onData(data => {
+      recordInput(data);
       if (native()) invoke("terminal_input", { sessionId: session.id, data: encode(data) }).catch(() => {});
     });
     const resize = terminal.onResize(size => {
@@ -114,26 +139,13 @@ function TerminalView({ session, visible, reconnect, setStatus, onHistory }: {
     observer.observe(element.current);
     let stop: (() => void) | undefined;
     const outputDecoder = new TextDecoder();
-    let scanBuffer = "";
 
     listen<TermEvent>("terminal-event", ({ payload }) => {
       if (payload.sessionId !== session.id) return;
       if (payload.kind === "data" && payload.data) {
         const output = decode(payload.data);
         terminal.write(output);
-        scanBuffer += outputDecoder.decode(output, { stream: true });
-        const beginMarker = "\u001eRELAY_HISTORY_BEGIN\u001f";
-        const endMarker = "\u001eRELAY_HISTORY_END\u001f";
-        const begin = scanBuffer.indexOf(beginMarker);
-        const end = begin >= 0 ? scanBuffer.indexOf(endMarker, begin + beginMarker.length) : -1;
-        if (begin >= 0 && end >= 0) {
-          const history = scanBuffer.slice(begin + beginMarker.length, end);
-          const commands = history.split(/\r?\n/).map(line => line.replace(/^\s*\d+\s+/, "").trim()).filter(Boolean);
-          onHistory(commands);
-          scanBuffer = scanBuffer.slice(end + endMarker.length);
-        } else if (begin < 0 && scanBuffer.length > 4096) {
-          scanBuffer = scanBuffer.slice(-4096);
-        }
+        recentOutput = (recentOutput + stripTerminalControls(outputDecoder.decode(output, { stream: true }))).slice(-1000);
       }
       if (payload.kind === "connected") setStatus("connected");
       if (payload.kind === "error") {
@@ -159,7 +171,6 @@ function App() {
   const [commands, setCommands] = useState<Cmd[]>(loadSafeCommands);
   const [commandTab, setCommandTab] = useState<"favorites" | "used">("favorites");
   const [commandDialog, setCommandDialog] = useState<{ command?: Cmd }>();
-  const [historySyncing, setHistorySyncing] = useState(false);
   const [sessions, setSessions] = useState<Sess[]>([]);
   const [activeId, setActiveId] = useState<string>();
   const [leftOpen, setLeftOpen] = useState(true);
@@ -167,6 +178,8 @@ function App() {
   const [leftView, setLeftView] = useState<"connections" | "explorer">("connections");
   const [explorerSessionId, setExplorerSessionId] = useState<string>();
   const [explorers, setExplorers] = useState<Record<string, ExplorerState>>({});
+  const [explorerSupport, setExplorerSupport] = useState<Record<string, ExplorerSupport>>({});
+  const explorerSupportRef = useRef<Record<string, ExplorerSupport>>({});
   const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Conn>();
@@ -184,6 +197,14 @@ function App() {
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
   const active = sessions.find(session => session.id === activeId);
+
+  function updateExplorerSupport(sessionId: string, support?: ExplorerSupport) {
+    const next = { ...explorerSupportRef.current };
+    if (support) next[sessionId] = support;
+    else delete next[sessionId];
+    explorerSupportRef.current = next;
+    setExplorerSupport(next);
+  }
 
   useEffect(() => {
     if (!native()) return;
@@ -208,18 +229,27 @@ function App() {
         setSessions(items => {
           const session = items.find(item => item.id === payload.sessionId);
           if (session && connectionTypeOf(session.connection) === "ssh") {
-            setLeftView("explorer");
-            setExplorerSessionId(payload.sessionId);
-            loadRemoteDirectory(payload.sessionId, ".");
+            updateExplorerSupport(payload.sessionId, "checking");
+            setExplorers(explorers => ({ ...explorers, [payload.sessionId]: { path: ".", entries: [], loading: true } }));
+            invoke("list_remote_directory", { sessionId: payload.sessionId, path: "." }).catch(reason => {
+              updateExplorerSupport(payload.sessionId, "unavailable");
+              setExplorers(explorers => ({ ...explorers, [payload.sessionId]: { path: ".", entries: [], loading: false, error: String(reason) } }));
+            });
           }
           return items;
         });
       }
       if (payload.kind === "directory" && payload.data) {
         const listing = JSON.parse(payload.data) as DirectoryListing;
+        if (explorerSupportRef.current[payload.sessionId] === "checking") {
+          setExplorerSessionId(payload.sessionId);
+          setLeftView("explorer");
+        }
+        updateExplorerSupport(payload.sessionId, "available");
         setExplorers(items => ({ ...items, [payload.sessionId]: { ...listing, loading: false } }));
       }
       if (payload.kind === "directoryError") {
+        if (explorerSupportRef.current[payload.sessionId] === "checking") updateExplorerSupport(payload.sessionId, "unavailable");
         setExplorers(items => ({ ...items, [payload.sessionId]: { path: items[payload.sessionId]?.path || ".", entries: items[payload.sessionId]?.entries || [], loading: false, error: payload.message || "Unable to list directory" } }));
       }
     }).then(unlisten => stop = unlisten);
@@ -289,16 +319,17 @@ function App() {
     const existing = sessions.find(session => session.connection.id === connection.id && session.status !== "closed");
     if (existing) {
       setActiveId(existing.id);
-      if (existing.status === "connected" && connectionTypeOf(existing.connection) === "ssh") {
+      if (existing.status === "connected" && explorerSupport[existing.id] === "available") {
         setLeftView("explorer");
         setExplorerSessionId(existing.id);
         loadRemoteDirectory(existing.id, explorers[existing.id]?.path || ".");
-      }
+      } else setLeftView("connections");
       return;
     }
     const session: Sess = { id: crypto.randomUUID(), connection, status: "connecting" };
     setSessions(items => [...items, session]);
     setActiveId(session.id);
+    setLeftView("connections");
     start(session);
   }
 
@@ -306,13 +337,20 @@ function App() {
     if (native()) await invoke("close_session", { sessionId: id }).catch(() => {});
     const remaining = sessions.filter(session => session.id !== id);
     setSessions(remaining);
+    updateExplorerSupport(id);
+    setExplorers(items => { const next = { ...items }; delete next[id]; return next; });
     if (activeId === id) setActiveId(remaining.at(-1)?.id);
+    if (leftView === "explorer" && !remaining.some(session => explorerSupport[session.id] === "available")) setLeftView("connections");
   }
 
   async function loadRemoteDirectory(sessionId: string, path: string) {
     const session = sessions.find(item => item.id === sessionId);
     if (session && connectionTypeOf(session.connection) !== "ssh") {
       setError("File Explorer is only available for SSH connections.");
+      return;
+    }
+    if (explorerSupport[sessionId] === "unavailable") {
+      setError("This device does not provide an SFTP file system.");
       return;
     }
     setExplorers(items => ({ ...items, [sessionId]: { path, entries: items[sessionId]?.entries || [], loading: true } }));
@@ -491,33 +529,27 @@ function App() {
 
   const commandUses = (command: Cmd) => active ? command.usesByConnection?.[active.connection.id] || 0 : 0;
 
-  async function syncShellHistory() {
-    if (!active || active.status !== "connected") { setError("Connect a session before syncing shell history."); return; }
-    if (connectionTypeOf(active.connection) !== "ssh") { setError("Shell-history sync is only available for SSH sessions."); return; }
-    setHistorySyncing(true);
-    const request = `printf '\\036RELAY_HISTORY_BEGIN\\037'; fc -l -200; printf '\\036RELAY_HISTORY_END\\037'\r`;
-    try { await invoke("terminal_input", { sessionId: active.id, data: encode(request) }); }
-    catch (reason) { setHistorySyncing(false); setError(`Could not sync shell history: ${String(reason)}`); }
-  }
-
-  function importHistory(connectionId: string, history: string[]) {
-    const usable = history.filter(command => command && !command.includes("RELAY_HISTORY_") && !/^fc\s+-l\b/.test(command) && !containsSensitiveMaterial(command));
-    const frequencies = new Map<string, number>();
-    usable.forEach(command => frequencies.set(command, (frequencies.get(command) || 0) + 1));
+  function trackCommand(connectionId: string, commandText: string) {
+    const normalized = commandText.trim();
+    if (!normalized || normalized.length > 1000 || containsSensitiveMaterial(normalized)) return;
     setCommands(items => {
       const next = [...items];
-      frequencies.forEach((count, commandText) => {
-        const index = next.findIndex(command => command.command === commandText && (command.connectionId === connectionId || !command.connectionId));
-        if (index >= 0) {
-          const command = next[index];
-          next[index] = { ...command, usesByConnection: { ...command.usesByConnection, [connectionId]: Math.max(command.usesByConnection?.[connectionId] || 0, count) } };
-        } else {
-          next.push({ id: crypto.randomUUID(), name: commandText, command: commandText, uses: count, usesByConnection: { [connectionId]: count }, connectionId, favorite: false });
-        }
-      });
+      const index = next.findIndex(command => command.command === normalized && (command.connectionId === connectionId || !command.connectionId));
+      if (index >= 0) {
+        const command = next[index];
+        next[index] = {
+          ...command,
+          uses: command.uses + 1,
+          usesByConnection: { ...command.usesByConnection, [connectionId]: (command.usesByConnection?.[connectionId] || 0) + 1 }
+        };
+      } else {
+        next.push({
+          id: crypto.randomUUID(), name: normalized, command: normalized, uses: 1,
+          usesByConnection: { [connectionId]: 1 }, connectionId, favorite: false, tracked: true
+        });
+      }
       return next;
     });
-    setHistorySyncing(false);
   }
 
   const visible = (folder: string) => connections.filter(connection => connection.folder === folder && `${connection.name} ${connectionEndpoint(connection)}`.toLowerCase().includes(search.toLowerCase()));
@@ -571,8 +603,9 @@ function App() {
     });
   }
 
+  const explorerSessions = sessions.filter(session => session.status === "connected" && explorerSupport[session.id] === "available");
   const explorerId = explorerSessionId || activeId;
-  const explorerSession = sessions.find(session => session.id === explorerId && connectionTypeOf(session.connection) === "ssh");
+  const explorerSession = explorerSessions.find(session => session.id === explorerId);
   const explorer = explorerId ? explorers[explorerId] : undefined;
   const parentDirectory = (path: string) => path === "/" ? "/" : path.slice(0, path.lastIndexOf("/")) || "/";
   const fileSize = (size: number) => size < 1024 ? `${size} B` : size < 1048576 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1048576).toFixed(1)} MB`;
@@ -581,7 +614,7 @@ function App() {
     <header><b><i>R</i>Relay</b>{availableUpdate && <button className="update-ready" onClick={() => setAvailableUpdate(availableUpdate)}>⬆ Update {availableUpdate.version}</button>}<button className="update-check" title="Check for updates" disabled={updateChecking || updateInstalling} onClick={() => checkForUpdates()}>{updateChecking ? "Checking…" : "↻ Updates"}</button><button onClick={openNewConnection}>＋ New session</button></header>
     <aside className="left">
       <Title over="Workspace" title={leftView === "connections" ? "Connections" : "Explorer"} close={() => setLeftOpen(false)} symbol="‹" />
-      <div className="left-tabs"><button className={leftView === "connections" ? "active" : ""} onClick={() => setLeftView("connections")}>Connections</button><button className={leftView === "explorer" ? "active" : ""} disabled={!sessions.some(session => session.status === "connected" && connectionTypeOf(session.connection) === "ssh")} onClick={() => setLeftView("explorer")}>Explorer</button></div>
+      <div className="left-tabs"><button className={leftView === "connections" ? "active" : ""} onClick={() => setLeftView("connections")}>Connections</button><button className={leftView === "explorer" ? "active" : ""} title={explorerSessions.length ? "Browse a connected server" : "No connected device provides SFTP"} disabled={!explorerSessions.length} onClick={() => setLeftView("explorer")}>Explorer</button></div>
       {leftView === "connections" ? <>
         <label className="search">⌕<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a connection…" /></label>
         <div className="add"><button onClick={openNewConnection}>＋ Connection</button><button onClick={() => setFolderDialog({ mode: "create", folder: selectedFolder || undefined })}>＋ Folder</button></div>
@@ -593,7 +626,7 @@ function App() {
           {renderFolders("")}
         </nav>
       </> : <div className="explorer-panel">
-        <select className="explorer-session" value={explorerSession?.id || ""} onChange={event => { const id = event.target.value; setExplorerSessionId(id); setActiveId(id); loadRemoteDirectory(id, explorers[id]?.path || "."); }}>{sessions.filter(session => session.status === "connected" && connectionTypeOf(session.connection) === "ssh").map(session => <option key={session.id} value={session.id}>{session.connection.name}</option>)}</select>
+        <select className="explorer-session" value={explorerSession?.id || ""} onChange={event => { const id = event.target.value; setExplorerSessionId(id); setActiveId(id); loadRemoteDirectory(id, explorers[id]?.path || "."); }}>{explorerSessions.map(session => <option key={session.id} value={session.id}>{session.connection.name}</option>)}</select>
         {explorerSession ? <>
           <div className="explorer-toolbar"><button title="Parent folder" disabled={!explorer || explorer.path === "/"} onClick={() => explorer && loadRemoteDirectory(explorerSession.id, parentDirectory(explorer.path))}>↑</button><code title={explorer?.path}>{explorer?.path || "Loading…"}</code><button title="Refresh" onClick={() => loadRemoteDirectory(explorerSession.id, explorer?.path || ".")}>↻</button></div>
           <button className="open-in-terminal" disabled={!explorer || explorer.loading} onClick={openExplorerPathInTerminal}><span>›_</span> Open this folder in terminal</button>
@@ -605,9 +638,9 @@ function App() {
     </aside>
     {!leftOpen && <button className="reopen l" onClick={() => setLeftOpen(true)}>▰</button>}
     <main>
-      <div className="tabs">{sessions.map(session => <button className={activeId === session.id ? "active" : ""} onClick={() => { setActiveId(session.id); if (leftView === "explorer" && session.status === "connected" && connectionTypeOf(session.connection) === "ssh") { setExplorerSessionId(session.id); loadRemoteDirectory(session.id, explorers[session.id]?.path || "."); } }} key={session.id}>● {session.connection.name} <span onClick={event => { event.stopPropagation(); closeSession(session.id); }}>×</span></button>)}<button onClick={openNewConnection}>＋</button></div>
+      <div className="tabs">{sessions.map(session => <button className={activeId === session.id ? "active" : ""} onClick={() => { setActiveId(session.id); if (leftView === "explorer") { if (explorerSupport[session.id] === "available") { setExplorerSessionId(session.id); loadRemoteDirectory(session.id, explorers[session.id]?.path || "."); } else setLeftView("connections"); } }} key={session.id}>● {session.connection.name} <span onClick={event => { event.stopPropagation(); closeSession(session.id); }}>×</span></button>)}<button onClick={openNewConnection}>＋</button></div>
       <div className="session">●　{active ? <><b>{active.connection.name}</b>　{connectionTypeOf(active.connection) === "serial" ? connectionEndpoint(active.connection) : `${active.connection.user}@${active.connection.host}:${active.connection.port}`}</> : <>No active session</>}<span>{active ? active.status : "Choose a bookmark"}</span></div>
-      <div className="term-stack">{sessions.map(session => <TerminalView key={session.id} session={session} visible={session.id === activeId} reconnect={(replace, accept) => start(session, replace, accept)} setStatus={status => setSessions(items => items.map(item => item.id === session.id ? { ...item, status } : item))} onHistory={history => importHistory(session.connection.id, history)} />)}</div>
+      <div className="term-stack">{sessions.map(session => <TerminalView key={session.id} session={session} visible={session.id === activeId} reconnect={(replace, accept) => start(session, replace, accept)} setStatus={status => setSessions(items => items.map(item => item.id === session.id ? { ...item, status } : item))} onCommand={command => trackCommand(session.connection.id, command)} />)}</div>
       <div className="status">●　{active?.status || "Ready"}<span>UTF-8　xterm-256color</span></div>
       {error && <button className="error" onClick={() => setError("")}>{error}　×</button>}
     </main>
@@ -615,8 +648,7 @@ function App() {
       <Title over="This session" title="Command shelf" close={() => setRightOpen(false)} symbol="›" />
       <div className="ctabs"><button className={commandTab === "favorites" ? "active" : ""} onClick={() => setCommandTab("favorites")}>Favorites</button><button className={commandTab === "used" ? "active" : ""} onClick={() => setCommandTab("used")}>Most used</button></div>
       <div className="commands">{[...commands].filter(command => !command.connectionId || command.connectionId === active?.connection.id).filter(command => commandTab === "used" || command.favorite !== false).sort((a,b) => commandTab === "used" ? commandUses(b)-commandUses(a) || a.name.localeCompare(b.name) : a.name.localeCompare(b.name)).map(command => { const sessionUses = commandUses(command); return <article key={command.id}><i>⌁</i><span><b>{command.name}</b><small>{command.command}</small>{commandTab === "used" && <em>{active ? `${sessionUses} run${sessionUses === 1 ? "" : "s"} on ${active.connection.name}` : "Select a connection"}</em>}</span><div className="command-actions"><button title={command.favorite === false ? "Add to favorites" : "Remove from favorites"} onClick={() => setCommands(items => items.map(item => item.id === command.id ? { ...item, favorite: item.favorite === false } : item))}>{command.favorite === false ? "☆" : "★"}</button><button title="Edit command" onClick={() => setCommandDialog({ command })}>✎</button><button title="Run command" disabled={!active || active.status !== "connected"} onClick={() => runCommand(command)}>▶</button></div></article>; })}</div>
-      {!commands.filter(command => !command.connectionId || command.connectionId === active?.connection.id).some(command => commandTab === "used" || command.favorite !== false) && <div className="commands-empty"><b>{commandTab === "favorites" ? "No favorites yet" : "No saved commands yet"}</b><span>Save a command to start building your shelf.</span></div>}
-      {commandTab === "used" && <button className="save history-sync" disabled={!active || active.status !== "connected" || connectionTypeOf(active.connection) !== "ssh" || historySyncing} onClick={syncShellHistory}>{historySyncing ? "↻ Syncing…" : "↻ Sync shell history"}</button>}
+      {!commands.filter(command => !command.connectionId || command.connectionId === active?.connection.id).some(command => commandTab === "used" || command.favorite !== false) && <div className="commands-empty"><b>{commandTab === "favorites" ? "No favorites yet" : "No commands tracked yet"}</b><span>{commandTab === "used" ? "Commands you run on this connection will appear here." : "Save a command to start building your shelf."}</span></div>}
       <button className="save" onClick={() => setCommandDialog({})}>＋ Save a command</button>
     </aside>
     {!rightOpen && <button className="reopen r" onClick={() => setRightOpen(true)}>⌁</button>}
