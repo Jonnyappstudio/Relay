@@ -110,6 +110,33 @@ function TerminalView({ session, visible, reconnect, setStatus, onCommand }: {
     fit.current = fitAddon;
     terminal.writeln(`\x1b[32mConnecting to ${connectionEndpoint(session.connection)}…\x1b[0m`);
 
+    terminal.attachCustomKeyEventHandler(event => {
+      if (event.type !== "keydown" || event.key.toLowerCase() !== "c") return true;
+
+      const copyShortcut = event.metaKey || event.ctrlKey;
+      if (!copyShortcut || !terminal.hasSelection()) return true;
+
+      const selection = terminal.getSelection();
+      navigator.clipboard.writeText(selection).catch(() => {
+        const textarea = document.createElement("textarea");
+        textarea.value = selection;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+        terminal.focus();
+      });
+      return false;
+    });
+
+    const sendTerminalSize = () => {
+      if (native() && terminal.cols > 0 && terminal.rows > 0) {
+        invoke("resize_terminal", { sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).catch(() => {});
+      }
+    };
+
     let inputBuffer = "";
     let recentOutput = "";
     const recordInput = (data: string) => {
@@ -135,8 +162,12 @@ function TerminalView({ session, visible, reconnect, setStatus, onCommand }: {
     const resize = terminal.onResize(size => {
       if (native()) invoke("resize_terminal", { sessionId: session.id, cols: size.cols, rows: size.rows }).catch(() => {});
     });
-    const observer = new ResizeObserver(() => fitAddon.fit());
+    const observer = new ResizeObserver(() => {
+      fitAddon.fit();
+      sendTerminalSize();
+    });
     observer.observe(element.current);
+    sendTerminalSize();
     let stop: (() => void) | undefined;
     const outputDecoder = new TextDecoder();
 
@@ -147,7 +178,13 @@ function TerminalView({ session, visible, reconnect, setStatus, onCommand }: {
         terminal.write(output);
         recentOutput = (recentOutput + stripTerminalControls(outputDecoder.decode(output, { stream: true }))).slice(-1000);
       }
-      if (payload.kind === "connected") setStatus("connected");
+      if (payload.kind === "connected") {
+        setStatus("connected");
+        requestAnimationFrame(() => {
+          fitAddon.fit();
+          sendTerminalSize();
+        });
+      }
       if (payload.kind === "error") {
         setStatus("error");
         terminal.writeln(`\r\n\x1b[31m${payload.message}\x1b[0m`);

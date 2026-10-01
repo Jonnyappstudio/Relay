@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use ssh2::{CheckResult, KnownHostFileKind, Session};
+use ssh2::{CheckResult, ErrorCode, KnownHostFileKind, Session};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -245,6 +245,17 @@ fn list_directory(ssh: &Session, requested: &str) -> Result<DirectoryListing, St
         entries,
     })
 }
+fn ssh_would_block(error: &ssh2::Error) -> bool {
+    matches!(error.code(), ErrorCode::Session(-37))
+}
+
+fn retryable_transport_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
+    ) || error.to_string().to_lowercase().contains("transport read")
+}
+
 fn worker(
     app: AppHandle,
     r: ConnectRequest,
@@ -273,16 +284,15 @@ fn worker(
     ssh.set_blocking(false);
     event(&app, &r.session_id, "connected", None, None, None);
     let mut buf = [0u8; 16384];
+    let mut pending_input = VecDeque::<u8>::new();
+    let mut pending_resize = None::<(u32, u32)>;
+    let mut transient_transport_failures = 0u16;
     loop {
-        while let Ok(cmd) = rx.try_recv() {
+        for _ in 0..64 {
+            let Ok(cmd) = rx.try_recv() else { break };
             match cmd {
-                Command::Input(v) => {
-                    channel.write_all(&v).map_err(|e| e.to_string())?;
-                    let _ = channel.flush();
-                }
-                Command::Resize(c, rows) => channel
-                    .request_pty_size(c, rows, None, None)
-                    .map_err(|e| e.to_string())?,
+                Command::Input(value) => pending_input.extend(value),
+                Command::Resize(cols, rows) => pending_resize = Some((cols, rows)),
                 Command::ListDirectory(path) => {
                     ssh.set_blocking(true);
                     let listing = list_directory(&ssh, &path);
@@ -312,19 +322,76 @@ fn worker(
                 }
             }
         }
+
+        if let Some((cols, rows)) = pending_resize {
+            match channel.request_pty_size(cols, rows, None, None) {
+                Ok(()) => pending_resize = None,
+                Err(error) if ssh_would_block(&error) => {}
+                Err(error)
+                    if error.to_string().to_lowercase().contains("transport read")
+                        && transient_transport_failures < 250 =>
+                {
+                    transient_transport_failures += 1;
+                }
+                Err(error) => return Err(format!("Terminal resize failed: {error}")),
+            }
+        }
+
+        if !pending_input.is_empty() {
+            let contiguous = pending_input.make_contiguous();
+            let write_count = contiguous.len().min(16384);
+            match channel.write(&contiguous[..write_count]) {
+                Ok(0) => {}
+                Ok(written) => {
+                    transient_transport_failures = 0;
+                    pending_input.drain(..written);
+                    if pending_input.is_empty() {
+                        match channel.flush() {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                            Err(error)
+                                if retryable_transport_io(&error)
+                                    && transient_transport_failures < 250 =>
+                            {
+                                transient_transport_failures += 1;
+                            }
+                            Err(error) => return Err(format!("Write failed: {error}")),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error)
+                    if retryable_transport_io(&error) && transient_transport_failures < 250 =>
+                {
+                    transient_transport_failures += 1;
+                }
+                Err(error) => return Err(format!("Write failed: {error}")),
+            }
+        }
+
         match channel.read(&mut buf) {
             Ok(0) if channel.eof() => return Ok(()),
-            Ok(0) => thread::sleep(Duration::from_millis(8)),
-            Ok(n) => event(
-                &app,
-                &r.session_id,
-                "data",
-                Some(B64.encode(&buf[..n])),
-                None,
-                None,
-            ),
+            Ok(0) => {
+                transient_transport_failures = 0;
+                thread::sleep(Duration::from_millis(4));
+            }
+            Ok(n) => {
+                transient_transport_failures = 0;
+                event(
+                    &app,
+                    &r.session_id,
+                    "data",
+                    Some(B64.encode(&buf[..n])),
+                    None,
+                    None,
+                )
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(8)),
-            Err(e) => return Err(format!("Read failed: {e}")),
+            Err(error) if retryable_transport_io(&error) && transient_transport_failures < 250 => {
+                transient_transport_failures += 1;
+                thread::sleep(Duration::from_millis(8));
+            }
+            Err(error) => return Err(format!("Read failed: {error}")),
         }
     }
 }
